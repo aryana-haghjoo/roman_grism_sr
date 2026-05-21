@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+
+# Data (large files)
+data/*.npz
+data/*.pkl
+data/*.fits
+data/*.h5
+data/*.hdf5
+
+# Model weights
+models/*.pth
+models/*.pt
+
+# Results (keep plots, ignore large npz)
+results/*.npz
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Wandb
+wandb/
+
+# IDE
+.vscode/
+.idea/
