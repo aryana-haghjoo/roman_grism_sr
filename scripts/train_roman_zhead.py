@@ -42,6 +42,7 @@ ZHEAD_DIR      = SR_REPO / "train" / "redshift_head"
 TRAIN_NPZ      = REPO / "data" / "roman_train_spectra.npz"
 VAL_NPZ        = REPO / "data" / "roman_mock_spectra.npz"
 OUT_DIR        = REPO / "train" / "roman_zhead"
+DEFAULT_SR1_CKPT = str(SR1_DIR / "best_superres_model.pth")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -99,7 +100,7 @@ class ForwardModeledRomanDataset(Dataset):
 
 
 # ── SR1 loader ────────────────────────────────────────────────────────────────
-def load_sr1(device):
+def load_sr1(device, ckpt_path=None):
     import yaml
     with open(str(SR1_DIR / "best_config.yaml")) as f:
         cfg = yaml.safe_load(f) or {}
@@ -112,13 +113,17 @@ def load_sr1(device):
         num_res_blocks=int(cfg.get("num_res_blocks", 12)),
         dropout=float(cfg.get("dropout", 0.02)),
     ).to(device)
-    ckpt = torch.load(str(SR1_DIR / "best_superres_model.pth"), map_location="cpu")
-    model.load_state_dict(ckpt)
+
+    path = ckpt_path or DEFAULT_SR1_CKPT
+    ckpt = torch.load(path, map_location="cpu")
+    # fine-tuned checkpoint stores weights under 'sr1_state_dict'
+    state = ckpt.get("sr1_state_dict", ckpt)
+    model.load_state_dict(state)
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
     n = sum(p.numel() for p in model.parameters())
-    print(f"SR1 loaded and frozen ({n:,} params)")
+    print(f"SR1 loaded and frozen ({n:,} params) from {Path(path).name}")
     return model
 
 
@@ -169,6 +174,9 @@ def main():
     ap.add_argument("--dropout",       type=float, default=0.1)
     ap.add_argument("--finetune",      action="store_true",
                     help="Warm-start from the JWST z-head weights")
+    ap.add_argument("--sr1_ckpt",      type=str,   default=None,
+                    help="Path to SR1 checkpoint (default: JWST best_superres_model.pth). "
+                         "Pass train/roman_sr1/best_sr1_roman.pth to use the fine-tuned SR1.")
     ap.add_argument("--wandb_project", type=str,   default="roman_grism_sr")
     ap.add_argument("--wandb_name",    type=str,   default="roman_zhead_v2")
     ap.add_argument("--wandb_mode",    type=str,   default="disabled",
@@ -208,7 +216,7 @@ def main():
           f"norm_range=[{z_min_n:.3f}, {z_max_n:.3f}]")
 
     # ── Models ────────────────────────────────────────────────────────────────
-    sr1   = load_sr1(device)
+    sr1   = load_sr1(device, ckpt_path=args.sr1_ckpt)
     zhead = ZHead1D(in_channels=2, hidden_dim=args.hidden_dim,
                     num_blocks=args.num_blocks, dropout=args.dropout).to(device)
 
