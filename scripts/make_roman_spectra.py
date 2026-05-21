@@ -6,24 +6,33 @@ Forward-model JWST grating spectra through the Roman WFI grism response
 to produce simulated Roman grism 1D spectra.
 
 Inputs:
-  - JWST prism+grating test set from super_resolution repo
+  - JWST prism+grating dataset from super_resolution repo
   - Roman grism 1st-order throughput from romanisim
 
-Outputs:
-  - data/roman_mock_spectra.npz with:
-      roman_flux       : (N, 2500) Roman grism spectrum on JWST grid, zeroed outside Roman range
-      roman_flux_err   : (N, 2500) noise estimate on same grid
-      roman_wave_mask  : (2500,)   bool mask of Roman wavelength coverage
-      flux_high        : (N, 2500) JWST grating truth (HR target)
-      flux_high_err    : (N, 2500)
-      flux_low         : (N, 2500) JWST prism (for comparison)
-      wavelength_high  : (2500,)   wavelength grid in microns
-      z                : (N,)      redshifts
-      test_indices     : (N,)      indices into original dataset
+Outputs (depending on --split):
+  - data/roman_mock_spectra.npz   (--split test, default)
+  - data/roman_train_spectra.npz  (--split train)
+
+Each file contains:
+    roman_flux       : (N, 2500) Roman grism spectrum on JWST grid, zeroed outside Roman range
+    roman_flux_err   : (N, 2500) noise estimate on same grid
+    roman_wave_mask  : (2500,)   bool mask of Roman wavelength coverage
+    flux_high        : (N, 2500) JWST grating truth (HR target)
+    flux_high_err    : (N, 2500)
+    flux_low         : (N, 2500) JWST prism (for comparison)
+    wavelength_high  : (2500,)   wavelength grid in microns
+    z                : (N,)      redshifts
+    split_indices    : (N,)      indices into original dataset
+
+Usage:
+    python make_roman_spectra.py             # test split (default)
+    python make_roman_spectra.py --split train
 """
 
 import os
 import sys
+import argparse
+import hashlib
 import numpy as np
 from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
@@ -34,7 +43,6 @@ REPO = os.path.dirname(HERE)
 SR_REPO = os.path.join(os.path.dirname(REPO), "super_resolution")
 DATASET = os.path.join(SR_REPO, "data", "spectra_dataset_2500.npz")
 SPLIT_DIR = os.path.join(SR_REPO, "splits")
-OUT = os.path.join(REPO, "data", "roman_mock_spectra.npz")
 
 os.makedirs(os.path.join(REPO, "data"), exist_ok=True)
 
@@ -180,17 +188,25 @@ def embed_in_jwst_grid(roman_flux, roman_err, wave_roman_um, wave_jwst_um):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--split", choices=["train", "test"], default="test",
+                    help="Which dataset split to forward-model (default: test)")
+    args = ap.parse_args()
+
+    out_path = os.path.join(
+        REPO, "data",
+        "roman_mock_spectra.npz" if args.split == "test" else "roman_train_spectra.npz"
+    )
+
     print("Loading JWST dataset...")
     data = np.load(DATASET, allow_pickle=True)
-    flux_low  = data["flux_low"]    # (N_total, 2500)
-    flux_high = data["flux_high"]   # (N_total, 2500)
+    flux_low      = data["flux_low"]
+    flux_high     = data["flux_high"]
     flux_high_err = data["flux_high_err"]
-    wave_jwst = data["wavelength_high"].astype(np.float32)  # microns
-    z_all     = data["z"]
-    N_total   = len(flux_low)
+    wave_jwst     = data["wavelength_high"].astype(np.float32)
+    z_all         = data["z"]
 
     # Load the same train/test split used in SR1 training
-    import hashlib
     with open(DATASET, "rb") as f:
         ds_hash = hashlib.md5(f.read()).hexdigest()
     split_path = os.path.join(SPLIT_DIR, f"split_{ds_hash}.npz")
@@ -199,29 +215,28 @@ def main():
             f"Split file not found: {split_path}\n"
             f"Run the SR1 training script first to generate it."
         )
-    split = np.load(split_path)
-    test_idx = split["test_idx"]
-    print(f"Test set: {len(test_idx)} galaxies")
+    split     = np.load(split_path)
+    split_idx = split["train_idx"] if args.split == "train" else split["test_idx"]
+    print(f"{args.split.capitalize()} split: {len(split_idx)} galaxies")
 
     print("Loading Roman grism throughput from romanisim...")
     wave_roman_um, throughput_roman = load_roman_grism_throughput()
     print(f"Roman grism: {wave_roman_um.min():.3f} – {wave_roman_um.max():.3f} µm "
           f"({len(wave_roman_um)} pixels)")
 
-    print("Forward-modelling test set through Roman grism...")
-    N_test = len(test_idx)
-    roman_on_jwst_grid  = np.zeros((N_test, 2500), dtype=np.float32)
-    roman_err_on_grid   = np.zeros((N_test, 2500), dtype=np.float32)
+    print(f"Forward-modelling {args.split} set through Roman grism...")
+    N = len(split_idx)
+    roman_on_jwst_grid = np.zeros((N, 2500), dtype=np.float32)
+    roman_err_on_grid  = np.zeros((N, 2500), dtype=np.float32)
 
-    for i, idx in enumerate(test_idx):
+    for i, idx in enumerate(split_idx):
         if i % 500 == 0:
-            print(f"  {i}/{N_test}")
-        flux_hi = flux_high[idx].astype(np.float64)
+            print(f"  {i}/{N}")
         roman_flux, roman_err = forward_model_roman(
-            flux_hi, wave_jwst, wave_roman_um, throughput_roman,
+            flux_high[idx].astype(np.float64), wave_jwst, wave_roman_um, throughput_roman,
             seed=int(idx)
         )
-        out_flux, out_err, mask = embed_in_jwst_grid(
+        out_flux, out_err, _ = embed_in_jwst_grid(
             roman_flux, roman_err, wave_roman_um, wave_jwst
         )
         roman_on_jwst_grid[i] = out_flux
@@ -237,20 +252,20 @@ def main():
           f"{roman_wave_mask.sum()} / 2500 pixels "
           f"({100*roman_wave_mask.mean():.1f}%)")
 
-    print(f"Saving to {OUT}")
+    print(f"Saving to {out_path}")
     np.savez(
-        OUT,
+        out_path,
         roman_flux=roman_on_jwst_grid,
         roman_flux_err=roman_err_on_grid,
         roman_wave_mask=roman_wave_mask,
-        flux_high=flux_high[test_idx],
-        flux_high_err=flux_high_err[test_idx],
-        flux_low=flux_low[test_idx],
+        flux_high=flux_high[split_idx],
+        flux_high_err=flux_high_err[split_idx],
+        flux_low=flux_low[split_idx],
         wavelength_high=wave_jwst,
         wave_roman_um=wave_roman_um,
         throughput_roman=throughput_roman,
-        z=z_all[test_idx],
-        test_indices=test_idx,
+        z=z_all[split_idx],
+        split_indices=split_idx,
     )
     print("Done.")
 

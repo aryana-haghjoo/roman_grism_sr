@@ -2,16 +2,15 @@
 """
 train_roman_zhead.py
 
-Retrain the z-head on JWST prism spectra masked to the Roman grism wavelength
-window (0.99–1.95 µm). SR1 stays frozen; only the z-head weights are updated.
+Retrain the z-head on Roman forward-modeled spectra (from make_roman_spectra.py).
+SR1 stays frozen; only the z-head weights are updated.
 
-This directly targets the domain gap found in the zero-shot experiment: the
-JWST z-head was trained on full 1–5 µm spectra and fails on the 24% wavelength
-coverage that Roman provides. Re-training on the same partial-window input
-teaches the z-head to estimate redshift from Roman-like inputs.
+Inputs:
+  data/roman_train_spectra.npz  — forward-modeled training set (run make_roman_spectra.py --split train)
+  data/roman_mock_spectra.npz   — forward-modeled test set (existing)
 
-Input to SR1: flux_low (JWST prism) zeroed outside the Roman window, normalized
-on in-window pixels only — matching the normalization used in zeroshot_inference.py.
+Each spectrum is normalized using only the in-window pixels (matching zeroshot_inference.py),
+so SR1 sees the correct Roman-like input during z-head training.
 
 Usage:
     source ../../super_resolution/sup_res/bin/activate
@@ -29,7 +28,7 @@ import argparse
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from tqdm import tqdm
 
@@ -38,11 +37,11 @@ HERE    = Path(__file__).resolve().parent
 REPO    = HERE.parent
 SR_REPO = Path(os.path.dirname(REPO)) / "super_resolution"
 
-SR1_DIR   = SR_REPO / "train" / "sr1_best"
-ZHEAD_DIR = SR_REPO / "train" / "redshift_head"
-DATA_NPZ  = SR_REPO / "data" / "spectra_dataset_2500.npz"
-ROMAN_NPZ = REPO / "data" / "roman_mock_spectra.npz"
-OUT_DIR   = REPO / "train" / "roman_zhead"
+SR1_DIR        = SR_REPO / "train" / "sr1_best"
+ZHEAD_DIR      = SR_REPO / "train" / "redshift_head"
+TRAIN_NPZ      = REPO / "data" / "roman_train_spectra.npz"
+VAL_NPZ        = REPO / "data" / "roman_mock_spectra.npz"
+OUT_DIR        = REPO / "train" / "roman_zhead"
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -50,14 +49,14 @@ for p in [str(SR1_DIR), str(ZHEAD_DIR)]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from train_sr1 import SuperRes1D, get_or_make_split
+from train_sr1 import SuperRes1D
 from model_z_head import ZHead1D, heteroscedastic_nll
 
 
 # ── normalization ─────────────────────────────────────────────────────────────
 def normalize_roman_window(flux, roman_mask, eps=1e-25):
     """
-    Zero outside Roman window, normalize using only in-window pixels.
+    Normalize using only in-window pixels, zero elsewhere.
     Matches normalize_roman_input() in zeroshot_inference.py.
     """
     out = np.zeros(len(flux), dtype=np.float32)
@@ -71,32 +70,31 @@ def normalize_roman_window(flux, roman_mask, eps=1e-25):
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────
-class RomanWindowDataset(Dataset):
+class ForwardModeledRomanDataset(Dataset):
     """
-    JWST prism spectra (flux_low) masked and renormalized to the Roman grism
-    wavelength window. Pre-processed at init to avoid per-batch overhead.
+    Loads pre-generated Roman forward-modeled spectra (from make_roman_spectra.py)
+    and normalizes each spectrum using only the in-window pixels.
     """
-    def __init__(self, dataset_npz_path, roman_mask):
-        data = np.load(dataset_npz_path, allow_pickle=True)
-        flux_low = data["flux_low"]
-        self.z   = data["z"].astype(np.float32)
+    def __init__(self, npz_path):
+        data = np.load(str(npz_path), allow_pickle=True)
+        roman_flux = data["roman_flux"]                      # (N, 2500)
+        roman_mask = data["roman_wave_mask"].astype(bool)    # (2500,)
+        self.z     = data["z"].astype(np.float32)
 
-        print(f"Pre-processing {len(flux_low)} spectra to Roman window "
-              f"({roman_mask.sum()}/2500 pixels)...")
-        N = len(flux_low)
-        self.flux_masked = np.zeros((N, 2500), dtype=np.float32)
+        print(f"Normalizing {len(roman_flux)} forward-modeled Roman spectra "
+              f"from {Path(npz_path).name}...")
+        N = len(roman_flux)
+        self.flux_norm = np.zeros((N, 2500), dtype=np.float32)
         for i in range(N):
-            f = flux_low[i].copy()
-            f[~roman_mask] = 0.0
-            self.flux_masked[i] = normalize_roman_window(f, roman_mask)
+            self.flux_norm[i] = normalize_roman_window(roman_flux[i], roman_mask)
         print("Done.")
 
     def __len__(self):
         return len(self.z)
 
     def __getitem__(self, idx):
-        x = torch.tensor(self.flux_masked[idx], dtype=torch.float32)
-        z = torch.tensor(self.z[idx],           dtype=torch.float32)
+        x = torch.tensor(self.flux_norm[idx], dtype=torch.float32)
+        z = torch.tensor(self.z[idx],         dtype=torch.float32)
         return x, z
 
 
@@ -172,7 +170,7 @@ def main():
     ap.add_argument("--finetune",      action="store_true",
                     help="Warm-start from the JWST z-head weights")
     ap.add_argument("--wandb_project", type=str,   default="roman_grism_sr")
-    ap.add_argument("--wandb_name",    type=str,   default="roman_zhead")
+    ap.add_argument("--wandb_name",    type=str,   default="roman_zhead_v2")
     ap.add_argument("--wandb_mode",    type=str,   default="disabled",
                     choices=["online", "offline", "disabled"])
     args = ap.parse_args()
@@ -180,32 +178,28 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ── Roman window mask ─────────────────────────────────────────────────────
-    roman_data = np.load(str(ROMAN_NPZ), allow_pickle=True)
-    roman_mask = roman_data["roman_wave_mask"].astype(bool)
+    if not TRAIN_NPZ.exists():
+        raise FileNotFoundError(
+            f"{TRAIN_NPZ} not found.\n"
+            f"Run: python scripts/make_roman_spectra.py --split train"
+        )
 
-    # ── Dataset & split ───────────────────────────────────────────────────────
-    full_ds = RomanWindowDataset(str(DATA_NPZ), roman_mask)
-    N = len(full_ds)
-
-    # Reuse the exact same split as SR1 / JWST z-head training
-    train_idx, val_idx, _ = get_or_make_split(
-        str(DATA_NPZ), N, train_frac=0.8, seed=42,
-        split_dir=str(SR_REPO / "splits"),
-    )
-    print(f"Split: {len(train_idx)} train / {len(val_idx)} val")
+    # ── Dataset ───────────────────────────────────────────────────────────────
+    train_ds = ForwardModeledRomanDataset(TRAIN_NPZ)
+    val_ds   = ForwardModeledRomanDataset(VAL_NPZ)
+    print(f"Train: {len(train_ds)}  Val: {len(val_ds)}")
 
     train_loader = DataLoader(
-        Subset(full_ds, train_idx), batch_size=args.batch_size,
+        train_ds, batch_size=args.batch_size,
         shuffle=True, num_workers=4, pin_memory=True,
     )
     val_loader = DataLoader(
-        Subset(full_ds, val_idx), batch_size=args.batch_size,
+        val_ds, batch_size=args.batch_size,
         shuffle=False, num_workers=4, pin_memory=True,
     )
 
-    # ── z normalisation ───────────────────────────────────────────────────────
-    z_train = full_ds.z[train_idx]
+    # ── z normalisation (from train set) ─────────────────────────────────────
+    z_train = train_ds.z
     z_mean  = float(z_train.mean())
     z_std   = float(z_train.std())
     z_min_n = float((z_train.min() - z_mean) / z_std)
@@ -293,7 +287,6 @@ def main():
                 "z_min_n":          z_min_n,
                 "z_max_n":          z_max_n,
                 "use_sigma":        True,
-                "roman_mask_npixels": int(roman_mask.sum()),
                 "config":           vars(args),
             }, out_path)
             print(f"  -> best_roman_zhead.pth  (val={best_val:.4f})")
