@@ -36,6 +36,6 @@ wandb/
 .vscode/
 .idea/
 .venv/
-
+data/
 # Splits (derived from parent repo SR1 training script)
 splits/
